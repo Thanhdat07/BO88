@@ -1,224 +1,331 @@
-import React, { useRef, useState, useEffect } from 'react';
-import { Canvas, useFrame } from '@react-three/fiber';
-import { Physics, RigidBody } from '@react-three/rapier';
-import { Environment, Text, Html, useGLTF } from '@react-three/drei';
-import { create } from 'zustand';
-import * as THREE from 'three';
-
-// 1. STATE MANAGEMENT (Quản lý trạng thái Nút bấm & Game)
-const useGameStore = create((set) => ({
-  controls: { left: false, right: false, brake: false, gas: true, horn: false },
-  speed: 0,
-  battery: 85,
-  money: 150000,
-  setControl: (key, value) => set((state) => ({ controls: { ...state.controls, [key]: value } })),
-  setSpeed: (speed) => set({ speed }),
-}));
-
-// 2. COCKPIT (Giao diện buồng lái - Diegetic UI)
-// Được gắn trực tiếp vào Camera để di chuyển theo góc nhìn người chơi
-function Cockpit() {
-  const { speed, battery, money } = useGameStore();
-  const phoneRef = useRef();
-  
-  return (
-    <group position={[0, -0.6, -1.2]} rotation={[0.4, 0, 0]}>
-      {/* Cụm Ghi-đông (Placeholder) */}
-      <mesh position={[0, -0.2, 0]}>
-        <cylinderGeometry args={[0.02, 0.02, 1, 16]} rotation={[0, 0, Math.PI / 2]} />
-        <meshStandardMaterial color="#333" />
-      </mesh>
-
-      {/* Màn hình Điện thoại (GPS & Đơn hàng) */}
-      <group ref={phoneRef} position={[0, 0.2, -0.1]} rotation={[-0.2, 0, 0]}>
-        <mesh>
-          <boxGeometry args={[0.3, 0.5, 0.02]} />
-          <meshStandardMaterial color="#111" />
-        </mesh>
-        <Text position={[0, 0.2, 0.015]} fontSize={0.03} color="white">
-          BOGO APP
-        </Text>
-        <Text position={[0, 0.05, 0.015]} fontSize={0.04} color="#00ff00">
-          Đang giao: Trà Sữa
-        </Text>
-        <Text position={[0, -0.1, 0.015]} fontSize={0.03} color="yellow">
-          Thu nhập: {money.toLocaleString()}đ
-        </Text>
-        {/* Bản đồ (Minimap) có thể dùng RenderTexture của Drei tại đây */}
-      </group>
-
-      {/* Đồng hồ Odometer (Vận tốc & Pin) */}
-      <group position={[0.4, 0.1, -0.1]}>
-        <mesh>
-          <cylinderGeometry args={[0.15, 0.15, 0.02, 32]} />
-          <meshStandardMaterial color="#222" />
-        </mesh>
-        <Text position={[0, 0.05, 0.015]} fontSize={0.06} color="cyan">
-          {Math.abs(Math.round(speed))} km/h
-        </Text>
-        <Text position={[0, -0.05, 0.015]} fontSize={0.03} color={battery > 20 ? "green" : "red"}>
-          Pin: {battery}%
-        </Text>
-      </group>
-      
-      {/* Hai gương chiếu hậu (Trái/Phải) */}
-      {/* Sẽ sử dụng <RenderTexture> để chiếu camera phía sau vào đây */}
-      <mesh position={[-0.6, 0.4, -0.2]}>
-         <planeGeometry args={[0.3, 0.2]} />
-         <meshBasicMaterial color="#555" />
-      </mesh>
-      <mesh position={[0.6, 0.4, -0.2]}>
-         <planeGeometry args={[0.3, 0.2]} />
-         <meshBasicMaterial color="#555" />
-      </mesh>
-    </group>
-  );
-}
-
-// 3. MÔ PHỎNG XE MÁY & ĐIỀU KHIỂN
-function Motorcycle() {
-  const rigidBodyRef = useRef();
-  const { controls, setSpeed } = useGameStore();
-  const cameraRef = useRef(new THREE.PerspectiveCamera());
-
-  useFrame((state, delta) => {
-    if (!rigidBodyRef.current) return;
-
-    const rb = rigidBodyRef.current;
-    const velocity = rb.linvel();
-    
-    // Cập nhật vận tốc lên UI (Giả lập km/h)
-    setSpeed(velocity.z * 3.6); 
-
-    // Lực kéo (Gia tốc) & Phanh
-    const acceleration = 15;
-    const maxSpeed = 20; // m/s
-    let currentThrust = 0;
-
-    if (controls.gas && !controls.brake && velocity.z > -maxSpeed) {
-      currentThrust = -acceleration; // Chạy tới (trục Z âm)
-    } else if (controls.brake) {
-      currentThrust = acceleration * 1.5; // Phanh gấp
-    }
-
-    // Đánh lái (Trái / Phải) - Chuyển đổi thành Torque (mô-men xoắn)
-    const turnSpeed = 2.5;
-    let turnForce = 0;
-    
-    // Hiệu ứng nghiêng xe khi vào cua (Lean angle)
-    let leanAngle = 0; 
-
-    if (controls.left) {
-      turnForce = turnSpeed;
-      leanAngle = 0.3; // Nghiêng trái
-    }
-    if (controls.right) {
-      turnForce = -turnSpeed;
-      leanAngle = -0.3; // Nghiêng phải
-    }
-
-    // Áp dụng lực vào Physics Engine
-    rb.applyImpulse({ x: 0, y: 0, z: currentThrust * delta }, true);
-    rb.applyTorqueImpulse({ x: 0, y: turnForce * delta, z: 0 }, true);
-
-    // Gắn Camera vào vị trí của xe (FPP)
-    const pos = rb.translation();
-    const rot = rb.rotation();
-    
-    state.camera.position.set(pos.x, pos.y + 1.2, pos.z);
-    
-    // Tạo Quaternion xoay camera theo xe + hiệu ứng nghiêng
-    const euler = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(rot.x, rot.y, rot.z, rot.w));
-    euler.z = THREE.MathUtils.lerp(euler.z, leanAngle, 0.1); // Smooth nghiêng xe
-    state.camera.quaternion.setFromEuler(euler);
-  });
-
-  return (
-    <RigidBody ref={rigidBodyRef} colliders="cuboid" mass={100} position={[0, 1, 0]} linearDamping={1.5} angularDamping={2.5}>
-      <mesh visible={false}> {/* Ẩn Mesh vật lý, chỉ dùng để va chạm */}
-        <boxGeometry args={[0.6, 1, 2]} />
-        <meshStandardMaterial color="hotpink" />
-      </mesh>
-      {/* Render buồng lái gắn liền với xe */}
-      <Cockpit />
-    </RigidBody>
-  );
-}
-
-// 4. MÔI TRƯỜNG & ĐỊA HÌNH
-function CityEnvironment() {
-  return (
-    <group>
-      {/* Mặt đường */}
-      <RigidBody type="fixed" friction={1.5}>
-        <mesh position={[0, -0.5, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-          <planeGeometry args={[200, 1000]} />
-          <meshStandardMaterial color="#222" />
-        </mesh>
-      </RigidBody>
-
-      {/* Chướng ngại vật mô phỏng */}
-      <RigidBody position={[-2, 0.5, -20]} type="fixed">
-        <mesh>
-          <boxGeometry args={[1, 1, 1]} />
-          <meshStandardMaterial color="orange" />
-        </mesh>
-      </RigidBody>
-    </group>
-  );
-}
-
-// 5. GIAO DIỆN NÚT BẤM CẢM ỨNG (UI Overlay)
-function TouchControls() {
-  const { setControl } = useGameStore();
-
-  const handlePointerDown = (key) => () => setControl(key, true);
-  const handlePointerUp = (key) => () => setControl(key, false);
-
-  return (
-    <div style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>
-      {/* Nút Rẽ Trái / Phải (Bên trái màn hình) */}
-      <div style={{ position: 'absolute', bottom: 40, left: 40, display: 'flex', gap: 20, pointerEvents: 'auto' }}>
-        <button 
-          onPointerDown={handlePointerDown('left')} onPointerUp={handlePointerUp('left')} onPointerLeave={handlePointerUp('left')}
-          style={{ width: 80, height: 80, borderRadius: '50%', background: 'rgba(255,255,255,0.3)', border: '2px solid white', color: 'white', fontSize: 24 }}>◀</button>
-        <button 
-          onPointerDown={handlePointerDown('right')} onPointerUp={handlePointerUp('right')} onPointerLeave={handlePointerUp('right')}
-          style={{ width: 80, height: 80, borderRadius: '50%', background: 'rgba(255,255,255,0.3)', border: '2px solid white', color: 'white', fontSize: 24 }}>▶</button>
-      </div>
-
-      {/* Nút Phanh / Còi (Bên phải màn hình) */}
-      <div style={{ position: 'absolute', bottom: 40, right: 40, display: 'flex', gap: 20, pointerEvents: 'auto' }}>
-        <button 
-          onPointerDown={handlePointerDown('horn')} onPointerUp={handlePointerUp('horn')} onPointerLeave={handlePointerUp('horn')}
-          style={{ width: 80, height: 80, borderRadius: '50%', background: 'rgba(255,255,0,0.3)', border: '2px solid yellow', color: 'yellow', fontSize: 18 }}>Còi</button>
-        <button 
-          onPointerDown={handlePointerDown('brake')} onPointerUp={handlePointerUp('brake')} onPointerLeave={handlePointerUp('brake')}
-          style={{ width: 100, height: 80, borderRadius: 20, background: 'rgba(255,0,0,0.4)', border: '2px solid red', color: 'white', fontSize: 24 }}>THẮNG</button>
-      </div>
-    </div>
-  );
-}
-
-// 6. MAIN APP VÀ KHỞI TẠO CANVAS
-export default function BogoGame() {
-  return (
-    <div style={{ width: '100vw', height: '100vh', background: 'skyblue' }}>
-      <Canvas shadows camera={{ fov: 75, position: [0, 1.5, 2] }}>
-        <Environment preset="city" />
-        <ambientLight intensity={0.5} />
-        <directionalLight position={[10, 10, 5]} intensity={1} castShadow />
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+    <title>BOGO - Game Giao Hàng FPP</title>
+    <style>
+        /* CSS RESET & CƠ BẢN */
+        body, html { margin: 0; padding: 0; overflow: hidden; background-color: #87CEEB; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; touch-action: none; user-select: none; }
+        #gameCanvas { width: 100vw; height: 100vh; display: block; }
         
-        {/* Physics World */}
-        <Physics gravity={[0, -9.81, 0]}>
-          <Motorcycle />
-          <CityEnvironment />
-        </Physics>
-      </Canvas>
-      
-      {/* UI Overlay chèn đè lên 3D Canvas */}
-      <TouchControls />
+        /* GIAO DIỆN UI OVERLAY (Nút bấm) */
+        #uiLayer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+        .btn-group { position: absolute; bottom: 40px; display: flex; gap: 15px; pointer-events: auto; }
+        .btn-left { left: 30px; }
+        .btn-right { right: 30px; }
+        
+        .btn {
+            width: 70px; height: 70px; border-radius: 50%;
+            background: rgba(255, 255, 255, 0.2); border: 2px solid rgba(255, 255, 255, 0.5);
+            color: white; font-size: 24px; font-weight: bold;
+            display: flex; justify-content: center; align-items: center;
+            cursor: pointer; backdrop-filter: blur(5px);
+            transition: 0.1s;
+        }
+        .btn:active, .btn.active { background: rgba(255, 255, 255, 0.6); transform: scale(0.95); }
+        
+        .btn-brake { width: 90px; border-radius: 20px; background: rgba(255, 50, 50, 0.3); border-color: rgba(255, 50, 50, 0.8); }
+        .btn-brake:active, .btn-brake.active { background: rgba(255, 50, 50, 0.8); }
+        
+        .btn-horn { background: rgba(255, 255, 50, 0.3); border-color: rgba(255, 255, 50, 0.8); color: yellow; }
+        .btn-horn:active, .btn-horn.active { background: rgba(255, 255, 50, 0.8); color: white; }
+
+        /* Tiêu đề hướng dẫn góc trên */
+        #instructions {
+            position: absolute; top: 20px; left: 20px; color: white; pointer-events: none;
+            text-shadow: 1px 1px 2px black; font-size: 16px;
+        }
+    </style>
+
+    <!-- Khai báo thư viện Three.js thông qua CDN -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <!-- Vùng chứa 3D -->
+    <canvas id="gameCanvas"></canvas>
+    
+    <!-- Lớp UI 2D -->
+    <div id="uiLayer">
+        <div id="instructions">
+            <b>BOGO V0.1</b><br>
+            Sử dụng các nút trên màn hình<br>
+            Hoặc phím <b>Mũi tên / WASD</b>, Space (Thắng), H (Còi)
+        </div>
+
+        <div class="btn-group btn-left">
+            <div class="btn" id="btnLeft">◀</div>
+            <div class="btn" id="btnRight">▶</div>
+        </div>
+        <div class="btn-group btn-right">
+            <div class="btn btn-horn" id="btnHorn">Còi</div>
+            <div class="btn btn-brake" id="btnBrake">THẮNG</div>
+        </div>
     </div>
-  );
-}
-          
+
+    <!-- CODE LOGIC GAME -->
+    <script type="module">
+        import * as THREE from 'three';
+
+        // 1. CÀI ĐẶT CƠ BẢN (SCENE, CAMERA, RENDERER)
+        const canvas = document.getElementById('gameCanvas');
+        const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.shadowMap.enabled = true;
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color('#87CEEB');
+        scene.fog = new THREE.Fog('#87CEEB', 20, 150); // Sương mù che khuất tầm xa
+
+        // 2. MÔI TRƯỜNG & ĐỊA HÌNH
+        // Ánh sáng
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+        dirLight.position.set(50, 100, 50);
+        dirLight.castShadow = true;
+        scene.add(dirLight);
+
+        // Mặt đường (Dùng Lưới Grid tạo cảm giác tốc độ)
+        const planeGeo = new THREE.PlaneGeometry(1000, 1000);
+        const planeMat = new THREE.MeshStandardMaterial({ color: 0x333333 });
+        const plane = new THREE.Mesh(planeGeo, planeMat);
+        plane.rotation.x = -Math.PI / 2;
+        plane.receiveShadow = true;
+        scene.add(plane);
+        
+        const grid = new THREE.GridHelper(1000, 500, 0x555555, 0x222222);
+        grid.position.y = 0.01;
+        scene.add(grid);
+
+        // Tạo một số khối hộp giả lập các tòa nhà 2 bên đường
+        for (let i = 0; i < 200; i++) {
+            const height = Math.random() * 10 + 5;
+            const bGeo = new THREE.BoxGeometry(4, height, 4);
+            const bMat = new THREE.MeshStandardMaterial({ color: Math.random() * 0xffffff });
+            const building = new THREE.Mesh(bGeo, bMat);
+            
+            // Xếp ra 2 bên đường (để trống đoạn giữa x từ -5 đến 5)
+            const x = (Math.random() > 0.5 ? 1 : -1) * (Math.random() * 40 + 10);
+            const z = (Math.random() - 0.5) * 500;
+            
+            building.position.set(x, height / 2, z);
+            building.castShadow = true;
+            building.receiveShadow = true;
+            scene.add(building);
+        }
+
+        // 3. XE MÁY & BUỒNG LÁI (COCKPIT)
+        const moto = new THREE.Group();
+        moto.position.set(0, 0, 0);
+        scene.add(moto);
+
+        // Camera góc nhìn thứ nhất gắn vào đầu tài xế
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 200);
+        camera.position.set(0, 1.4, 0); // Độ cao mắt người ngồi xe
+        moto.add(camera);
+
+        // Tạo Texture động (CanvasTexture) để viết chữ lên màn hình điện thoại & đồng hồ
+        function createTextCanvas(width, height) {
+            const cvs = document.createElement('canvas');
+            cvs.width = width; cvs.height = height;
+            return { cvs, ctx: cvs.getContext('2d') };
+        }
+
+        const phoneUI = createTextCanvas(256, 512);
+        const phoneTexture = new THREE.CanvasTexture(phoneUI.cvs);
+        
+        const speedUI = createTextCanvas(256, 256);
+        const speedTexture = new THREE.CanvasTexture(speedUI.cvs);
+
+        // Thiết kế Ghi-đông (Handlebars)
+        const cockpit = new THREE.Group();
+        cockpit.position.set(0, -0.4, -0.6); // Đặt trước mặt và hơi chúi xuống
+        camera.add(cockpit); // Gắn buồng lái vào Camera để nó xoay theo đầu
+
+        // Thanh Ghi-đông ngang
+        const handleGeo = new THREE.CylinderGeometry(0.02, 0.02, 1, 16);
+        const handleMat = new THREE.MeshStandardMaterial({ color: 0x111111 });
+        const handleBar = new THREE.Mesh(handleGeo, handleMat);
+        handleBar.rotation.z = Math.PI / 2;
+        cockpit.add(handleBar);
+
+        // Điện thoại (App BOGO) ở giữa
+        const phoneGeo = new THREE.BoxGeometry(0.12, 0.22, 0.01);
+        const phoneMat = new THREE.MeshBasicMaterial({ map: phoneTexture }); // Dùng map là CanvasTexture
+        const phone = new THREE.Mesh(phoneGeo, phoneMat);
+        phone.position.set(0, 0.1, 0.05);
+        phone.rotation.x = -0.2; // Hơi ngửa lên
+        cockpit.add(phone);
+
+        // Đồng hồ Odometer (Bên phải)
+        const speedoGeo = new THREE.CylinderGeometry(0.08, 0.08, 0.01, 32);
+        const speedoMat = new THREE.MeshBasicMaterial({ map: speedTexture });
+        const speedometer = new THREE.Mesh(speedoGeo, speedoMat);
+        speedometer.position.set(0.2, 0.05, 0.05);
+        speedometer.rotation.x = -Math.PI / 2; // Xoay mặt lên trên
+        cockpit.add(speedometer);
+
+        // 4. HỆ THỐNG ĐIỀU KHIỂN & VẬT LÝ
+        const controls = { left: false, right: false, brake: false, gas: true, horn: false }; // Mặc định xe tự ga nhẹ
+
+        let currentSpeed = 0;
+        const maxSpeed = 20; // m/s (khoảng 72km/h)
+        const acceleration = 5; // Gia tốc
+        const brakePower = 20; // Lực phanh
+        const friction = 1; // Ma sát tự nhiên
+
+        // Bắt sự kiện UI (Touch/Click)
+        const bindBtn = (id, key) => {
+            const el = document.getElementById(id);
+            const press = (e) => { e.preventDefault(); controls[key] = true; el.classList.add('active'); };
+            const release = (e) => { e.preventDefault(); controls[key] = false; el.classList.remove('active'); };
+            el.addEventListener('mousedown', press);
+            el.addEventListener('touchstart', press, {passive: false});
+            window.addEventListener('mouseup', release);
+            el.addEventListener('touchend', release);
+        };
+
+        bindBtn('btnLeft', 'left');
+        bindBtn('btnRight', 'right');
+        bindBtn('btnBrake', 'brake');
+        bindBtn('btnHorn', 'horn');
+
+        // Bắt sự kiện Keyboard
+        window.addEventListener('keydown', (e) => {
+            if(e.key === 'ArrowLeft' || e.key === 'a') controls.left = true;
+            if(e.key === 'ArrowRight' || e.key === 'd') controls.right = true;
+            if(e.key === ' ' || e.key === 'ArrowDown' || e.key === 's') controls.brake = true;
+            if(e.key === 'h') controls.horn = true;
+            updateBtnVisuals();
+        });
+        window.addEventListener('keyup', (e) => {
+            if(e.key === 'ArrowLeft' || e.key === 'a') controls.left = false;
+            if(e.key === 'ArrowRight' || e.key === 'd') controls.right = false;
+            if(e.key === ' ' || e.key === 'ArrowDown' || e.key === 's') controls.brake = false;
+            if(e.key === 'h') controls.horn = false;
+            updateBtnVisuals();
+        });
+
+        function updateBtnVisuals() {
+            document.getElementById('btnLeft').classList.toggle('active', controls.left);
+            document.getElementById('btnRight').classList.toggle('active', controls.right);
+            document.getElementById('btnBrake').classList.toggle('active', controls.brake);
+            document.getElementById('btnHorn').classList.toggle('active', controls.horn);
+        }
+
+        // 5. CẬP NHẬT GIAO DIỆN ĐIỆN THOẠI & ĐỒNG HỒ ĐỘNG
+        function drawUI() {
+            // Vẽ màn hình điện thoại
+            const pCtx = phoneUI.ctx;
+            pCtx.fillStyle = '#111';
+            pCtx.fillRect(0, 0, 256, 512);
+            
+            pCtx.fillStyle = '#00ff00';
+            pCtx.font = 'bold 30px Arial';
+            pCtx.fillText('BOGO APP', 20, 50);
+            
+            pCtx.fillStyle = 'white';
+            pCtx.font = '24px Arial';
+            pCtx.fillText('Đang giao: Trà Sữa', 20, 100);
+            
+            pCtx.fillStyle = '#ffaa00';
+            pCtx.fillText('Thu nhập: 15.000đ', 20, 480);
+            
+            phoneTexture.needsUpdate = true;
+
+            // Vẽ đồng hồ tốc độ
+            const sCtx = speedUI.ctx;
+            sCtx.fillStyle = '#222';
+            sCtx.fillRect(0, 0, 256, 256);
+            
+            sCtx.fillStyle = 'cyan';
+            sCtx.font = 'bold 70px Arial';
+            sCtx.textAlign = 'center';
+            sCtx.fillText(Math.abs(Math.round(currentSpeed * 3.6)), 128, 140);
+            
+            sCtx.fillStyle = 'white';
+            sCtx.font = '20px Arial';
+            sCtx.fillText('km/h', 128, 180);
+            
+            speedTexture.needsUpdate = true;
+        }
+        drawUI(); // Vẽ lần đầu
+
+        // 6. MAIN GAME LOOP
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = Math.min(clock.getDelta(), 0.1); // Giới hạn delta tránh lag
+
+            // Xử lý Tăng tốc & Phanh
+            if (controls.gas && !controls.brake) {
+                currentSpeed += acceleration * delta;
+            }
+            if (controls.brake) {
+                currentSpeed -= brakePower * delta;
+            }
+            // Áp dụng ma sát (thả trôi xe)
+            if (!controls.gas && !controls.brake) {
+                currentSpeed -= friction * delta;
+            }
+
+            // Giới hạn tốc độ không lùi quá đà và không vượt Max Speed
+            currentSpeed = Math.max(0, Math.min(currentSpeed, maxSpeed));
+
+            // Xử lý Đánh lái & Nghiêng xe (Lean Angle)
+            let turnSpeed = 1.5;
+            let targetLean = 0;
+            
+            // Xe chỉ bẻ lái được khi đang chạy có tốc độ
+            const steeringFactor = currentSpeed / maxSpeed; 
+
+            if (controls.left) {
+                moto.rotation.y += turnSpeed * delta * (currentSpeed > 0 ? 1 : 0);
+                targetLean = 0.3; // Nghiêng trái
+            }
+            if (controls.right) {
+                moto.rotation.y -= turnSpeed * delta * (currentSpeed > 0 ? 1 : 0);
+                targetLean = -0.3; // Nghiêng phải
+            }
+
+            // Nội suy mềm mượt cho camera nghiêng (Lerp)
+            camera.rotation.z += (targetLean - camera.rotation.z) * 5 * delta;
+
+            // Di chuyển xe tới trước (Trục Z âm của Local Space)
+            moto.translateZ(-currentSpeed * delta);
+
+            // Cập nhật lại UI đồng hồ dựa trên tốc độ mới mỗi frame
+            drawUI(); 
+
+            // Còi (Đổi màu đường đua để test)
+            if (controls.horn) {
+                planeMat.color.setHex(0x552222);
+            } else {
+                planeMat.color.setHex(0x333333);
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // Xử lý Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Bắt đầu vòng lặp
+        animate();
+    </script>
+</body>
+</html>
